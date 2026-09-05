@@ -1,5 +1,6 @@
 """
-UPI Auto-Payment Verifier API - WITH ONE CLICK COPY FEATURE
+UPI Auto-Payment Verifier – Vercel Serverless Edition
+Premium Neon-Glow UI, all endpoints working.
 """
 
 import os
@@ -9,36 +10,33 @@ import json
 import logging
 import imaplib
 import email
-from email.header import decode_header
-from datetime import datetime
-from typing import Dict, Optional, Any
-from flask import Flask, request, jsonify, Response, stream_with_context
+import secrets
+import qrcode
+import sys
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
+from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ============================================
-# CONFIGURATION
+# CONFIG (read from environment, fallback defaults)
 # ============================================
 CONFIG = {
-    'UPI_ID': '9304619487@fam',
-    'PAYEE_NAME': 'mdnooralam',
-    'GMAIL_APP_PASSWORD': 'owjwtlotkfjnsftm',
-    'GMAIL_EMAIL': 'nkg166465@gmail.com',
-    'POLL_INTERVAL': 3,
-    'POLL_TIMEOUT': 60,
-    'QR_BASE_URL': 'https://upi-qrcode-generater-wroy.vercel.app/qr',
-    'PORT': int(os.getenv('PORT', 5000))
+    'UPI_ID': os.getenv('UPI_ID', '9304619487@fam'),
+    'PAYEE_NAME': os.getenv('PAYEE_NAME', 'Md Nooralam'),
+    'GMAIL_APP_PASSWORD': os.getenv('GMAIL_APP_PASSWORD', 'owjwtlotkfjnsftm'),
+    'GMAIL_EMAIL': os.getenv('GMAIL_EMAIL', 'nkg166465@gmail.com'),
+    'TIME_WINDOW_MINUTES': int(os.getenv('TIME_WINDOW_MINUTES', 5)),
+    'ADMIN_API_KEY': os.getenv('ADMIN_API_KEY', 'admin_1234567890'),
+    'MAX_EMAILS_CHECK': int(os.getenv('MAX_EMAILS_CHECK', 50)),
+    'SUPABASE_URL': os.getenv('SUPABASE_URL'),
+    'SUPABASE_KEY': os.getenv('SUPABASE_KEY'),
 }
 
 # ============================================
-# LOGGING
+# LOGGING (write to stderr for Vercel logs)
 # ============================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 # ============================================
@@ -48,76 +46,208 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================
-# HELPER: Generate Copy Text
+# GLOBAL EXCEPTION HANDLER (returns JSON)
 # ============================================
-
-def generate_copy_text(payment_details: Dict[str, Any]) -> str:
-    """Generate one-click copy text from payment details"""
-    lines = []
-    lines.append("📱 UPI PAYMENT RECEIPT")
-    lines.append("=" * 30)
-    
-    if payment_details.get('amount'):
-        lines.append(f"💰 Amount: ₹{payment_details['amount']:.2f}")
-    
-    if payment_details.get('transaction_id'):
-        lines.append(f"🆔 Transaction ID: {payment_details['transaction_id']}")
-    
-    if payment_details.get('utr'):
-        lines.append(f"🔢 UTR: {payment_details['utr']}")
-    
-    if payment_details.get('sender'):
-        lines.append(f"👤 From: {payment_details['sender']}")
-    
-    if payment_details.get('date'):
-        lines.append(f"📅 Date: {payment_details['date']}")
-    
-    if payment_details.get('purpose'):
-        lines.append(f"📝 Purpose: {payment_details['purpose']}")
-    
-    if payment_details.get('balance'):
-        lines.append(f"💳 Balance: ₹{payment_details['balance']:.2f}")
-    
-    lines.append("=" * 30)
-    lines.append(f"✅ Status: {payment_details.get('status', 'SUCCESS')}")
-    lines.append(f"⏱️ Verified at: {datetime.now().strftime('%I:%M %p, %d %b %Y')}")
-    
-    return "\n".join(lines)
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Unhandled exception: {e}", exc_info=True)
+    return jsonify({
+        'status': 'error',
+        'message': 'Internal server error',
+        'detail': str(e) if app.debug else None
+    }), 500
 
 # ============================================
-# IMAP FUNCTIONS
+# SUPABASE CLIENT (optional, with safe fallback)
 # ============================================
+supabase_client = None
+try:
+    from supabase import create_client
+    if CONFIG['SUPABASE_URL'] and CONFIG['SUPABASE_KEY']:
+        supabase_client = create_client(CONFIG['SUPABASE_URL'], CONFIG['SUPABASE_KEY'])
+        logger.info("Supabase client initialized.")
+    else:
+        logger.warning("Supabase credentials missing; using in‑memory fallback.")
+except ImportError:
+    logger.warning("supabase package not installed; using in‑memory fallback.")
+except Exception as e:
+    logger.error(f"Supabase init error: {e}; using in‑memory fallback.")
 
+# ============================================
+# FALLBACK STORAGE (in‑memory)
+# ============================================
+app.fallback_orders = {}
+app.fallback_api_keys = {}
+app.fallback_utrs = {}
+
+# ============================================
+# HELPER: timezone‑aware IST
+# ============================================
+IST = timezone(timedelta(hours=5, minutes=30))
+def now_ist():
+    return datetime.now(IST)
+
+def format_ist(dt):
+    return dt.strftime('%d-%m-%Y %H:%M:%S')
+
+# ============================================
+# DATABASE HELPERS (Supabase + fallback)
+# ============================================
+def db_create_order(api_key, amount):
+    order_id = f"Khan_{secrets.token_hex(4).upper()}"
+    now_utc = datetime.now(timezone.utc)
+    now_ist_dt = now_utc.astimezone(IST)
+    expires_utc = now_utc + timedelta(minutes=CONFIG['TIME_WINDOW_MINUTES'])
+    expires_ist_dt = expires_utc.astimezone(IST)
+    created_at_ist = format_ist(now_ist_dt)
+    expires_at_ist = format_ist(expires_ist_dt)
+    data = {
+        'order_id': order_id,
+        'api_key': api_key,
+        'amount': amount,
+        'payable_amount': amount,
+        'status': 'pending',
+        'created_at': created_at_ist,
+        'expires_at': expires_at_ist,
+        'utr': None,
+        'transaction_id': None,
+        'sender_name': None,
+        'payment_time': None,
+        'verified_at': None
+    }
+    if supabase_client:
+        try:
+            supabase_client.table('orders').insert(data).execute()
+            logger.info(f"Order {order_id} created in Supabase.")
+        except Exception as e:
+            logger.error(f"Supabase insert error: {e}")
+            app.fallback_orders[order_id] = data
+    else:
+        app.fallback_orders[order_id] = data
+    return order_id
+
+def db_get_order(order_id):
+    if supabase_client:
+        try:
+            result = supabase_client.table('orders').select('*').eq('order_id', order_id).execute()
+            if result.data:
+                return result.data[0]
+        except Exception as e:
+            logger.error(f"Supabase get error: {e}")
+    return app.fallback_orders.get(order_id)
+
+def db_update_order(order_id, **kwargs):
+    if supabase_client:
+        try:
+            supabase_client.table('orders').update(kwargs).eq('order_id', order_id).execute()
+        except Exception as e:
+            logger.error(f"Supabase update error: {e}")
+            if order_id in app.fallback_orders:
+                app.fallback_orders[order_id].update(kwargs)
+    else:
+        if order_id in app.fallback_orders:
+            app.fallback_orders[order_id].update(kwargs)
+
+def db_create_api_key(name, expiry_hours=24):
+    api_key = f"fam_{secrets.token_hex(20)}"
+    now_utc = datetime.now(timezone.utc)
+    expires_utc = now_utc + timedelta(hours=expiry_hours)
+    data = {
+        'api_key': api_key,
+        'name': name,
+        'created_at': now_utc.isoformat(),
+        'expires_at': expires_utc.isoformat(),
+        'is_active': 1
+    }
+    if supabase_client:
+        try:
+            supabase_client.table('api_keys').insert(data).execute()
+        except Exception as e:
+            logger.error(f"Supabase insert api_key error: {e}")
+            app.fallback_api_keys[api_key] = data
+    else:
+        app.fallback_api_keys[api_key] = data
+    return api_key
+
+def db_validate_api_key(api_key):
+    if supabase_client:
+        try:
+            result = supabase_client.table('api_keys').select('*').eq('api_key', api_key).eq('is_active', 1).execute()
+            if result.data:
+                key = result.data[0]
+                if datetime.now(timezone.utc).isoformat() < key['expires_at']:
+                    return key
+            return None
+        except Exception as e:
+            logger.error(f"Supabase validate error: {e}")
+    key = app.fallback_api_keys.get(api_key)
+    if key and key['is_active'] == 1 and datetime.now(timezone.utc).isoformat() < key['expires_at']:
+        return key
+    return None
+
+def db_is_utr_verified(utr):
+    if supabase_client:
+        try:
+            result = supabase_client.table('verified_utrs').select('*').eq('utr', utr).execute()
+            return len(result.data) > 0
+        except Exception as e:
+            logger.error(f"Supabase verify utr error: {e}")
+    return utr in app.fallback_utrs
+
+def db_mark_utr_verified(utr, order_id):
+    data = {'utr': utr, 'order_id': order_id, 'verified_at': datetime.now(timezone.utc).isoformat()}
+    if supabase_client:
+        try:
+            supabase_client.table('verified_utrs').insert(data).execute()
+        except Exception as e:
+            logger.error(f"Supabase mark utr error: {e}")
+            app.fallback_utrs[utr] = data
+    else:
+        app.fallback_utrs[utr] = data
+
+def db_get_pending_orders():
+    if supabase_client:
+        try:
+            result = supabase_client.table('orders').select('*').eq('status', 'pending').execute()
+            return result.data
+        except Exception as e:
+            logger.error(f"Supabase get pending error: {e}")
+    return [o for o in app.fallback_orders.values() if o['status'] == 'pending']
+
+def db_update_api_key(api_key, **kwargs):
+    if supabase_client:
+        try:
+            supabase_client.table('api_keys').update(kwargs).eq('api_key', api_key).execute()
+        except Exception as e:
+            logger.error(f"Supabase update api_key error: {e}")
+            if api_key in app.fallback_api_keys:
+                app.fallback_api_keys[api_key].update(kwargs)
+    else:
+        if api_key in app.fallback_api_keys:
+            app.fallback_api_keys[api_key].update(kwargs)
+
+# ============================================
+# GMAIL VERIFICATION (on-demand)
+# ============================================
 def connect_imap():
-    """Connect to Gmail using IMAP with App Password"""
-    try:
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(CONFIG['GMAIL_EMAIL'], CONFIG['GMAIL_APP_PASSWORD'])
-        mail.select('INBOX')
-        logger.info(f"✅ IMAP connected successfully")
-        return mail
-    except Exception as e:
-        logger.error(f"IMAP connection error: {e}")
-        raise Exception(f"Failed to connect to Gmail: {str(e)}")
+    if not CONFIG['GMAIL_EMAIL'] or not CONFIG['GMAIL_APP_PASSWORD']:
+        raise Exception("Gmail credentials not configured")
+    mail = imaplib.IMAP4_SSL('imap.gmail.com')
+    mail.login(CONFIG['GMAIL_EMAIL'], CONFIG['GMAIL_APP_PASSWORD'])
+    mail.select('INBOX')
+    return mail
 
-def get_email_body_from_imap(mail, msg_id: str) -> str:
-    """Get full email body from message ID using IMAP"""
+def get_email_body(mail, msg_id):
     try:
         result, data = mail.fetch(msg_id, '(RFC822)')
         if result != 'OK':
             return ''
-        
-        raw_email = data[0][1]
-        msg = email.message_from_bytes(raw_email)
-        
+        raw = data[0][1]
+        msg = email.message_from_bytes(raw)
         body = ''
-        
         if msg.is_multipart():
             for part in msg.walk():
-                content_type = part.get_content_type()
-                content_disposition = str(part.get('Content-Disposition'))
-                
-                if content_type == 'text/plain' and 'attachment' not in content_disposition:
+                if part.get_content_type() == 'text/plain' and 'attachment' not in str(part.get('Content-Disposition')):
                     try:
                         body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         break
@@ -127,723 +257,1128 @@ def get_email_body_from_imap(mail, msg_id: str) -> str:
             try:
                 body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
             except:
-                body = ''
-        
-        if not body:
-            if msg.is_multipart():
-                for part in msg.walk():
-                    content_type = part.get_content_type()
-                    if content_type == 'text/html':
-                        try:
-                            html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            body = re.sub(r'<[^>]+>', ' ', html)
-                            body = re.sub(r'\s+', ' ', body).strip()
-                            break
-                        except:
-                            continue
-        
+                pass
         return body
-    except Exception as e:
-        logger.error(f"Error getting email body: {e}")
+    except:
         return ''
 
-def parse_payment_email(body: str) -> Dict[str, Any]:
-    """Parse email body to extract payment details - FULLY IMPROVED"""
-    details = {
-        'amount': None,
-        'transaction_id': None,
-        'utr': None,
-        'date': None,
-        'balance': None,
-        'sender': None,
-        'purpose': None,
-        'type': None,  # 'received' or 'paid'
-        'raw_preview': body[:200]
-    }
-    
-    # ✅ Check if it's a RECEIVED or PAID transaction
+def parse_payment_email(body):
+    details = {'amount': None, 'utr': None, 'transaction_id': None, 'sender': None,
+               'date': None, 'type': None, 'payment_datetime': None, 'time_diff_minutes': None}
     if 'successfully received' in body.lower():
         details['type'] = 'received'
-        logger.info("📥 Transaction type: RECEIVED")
     elif 'successfully paid' in body.lower():
         details['type'] = 'paid'
-        logger.info("📤 Transaction type: PAID")
-    
-    # ✅ Amount extraction
-    amount_patterns = [
-        r'₹([0-9]+(\.[0-9]+)?)',
-        r'Amount\s*[:]\s*₹([0-9]+(\.[0-9]+)?)',
-        r'Rs\.?\s*([0-9]+(\.[0-9]+)?)',
-        r'INR\s*([0-9]+(\.[0-9]+)?)',
-        r'([0-9]+(\.[0-9]+)?)\s*INR',
-        r'([0-9]+(\.[0-9]+)?)\s*Rs\.?',
-    ]
-    
-    for pattern in amount_patterns:
-        match = re.search(pattern, body, re.IGNORECASE)
-        if match:
-            details['amount'] = float(match.group(1))
-            logger.info(f"💰 Found amount: ₹{details['amount']}")
+        return details
+    patterns = [r'₹([0-9]+(\.[0-9]+)?)', r'Amount\s*[:]\s*₹([0-9]+(\.[0-9]+)?)']
+    for p in patterns:
+        m = re.search(p, body, re.IGNORECASE)
+        if m:
+            details['amount'] = float(m.group(1))
             break
-    
-    # ✅ Transaction ID
-    tx_patterns = [
-        r'Transaction ID\s*[:]\s*([A-Z0-9]+)',
-        r'Txn ID\s*[:]\s*([A-Z0-9]+)',
-        r'Transaction\s*ID\s*[:]\s*([A-Z0-9]+)',
-        r'Txn\s*[:]\s*([A-Z0-9]+)',
-        r'with transaction id\s*([A-Z0-9]+)',
-    ]
-    for pattern in tx_patterns:
-        match = re.search(pattern, body, re.IGNORECASE)
-        if match:
-            details['transaction_id'] = match.group(1)
-            logger.info(f"📋 Transaction ID: {details['transaction_id']}")
+    utr_patterns = [r'UTR\s*[:]\s*([0-9]+)', r'UTR\s*([0-9]+)']
+    for p in utr_patterns:
+        m = re.search(p, body, re.IGNORECASE)
+        if m:
+            details['utr'] = m.group(1)
             break
-    
-    # ✅ UTR
-    utr_match = re.search(r'UTR\s*[:]\s*([0-9]+)', body, re.IGNORECASE)
-    if utr_match:
-        details['utr'] = utr_match.group(1)
-    
-    # ✅ Date
-    date_match = re.search(
-        r'([0-9]{2}:[0-9]{2}\s*(AM|PM)\s*IST,\s*[0-9]{2}\s*[A-Za-z]+\s*[0-9]{4})',
-        body, re.IGNORECASE
-    )
-    if date_match:
-        details['date'] = date_match.group(1)
-    
-    # ✅ Balance
-    balance_match = re.search(r'Updated Balance\s*[:]\s*₹([0-9]+(\.[0-9]+)?)', body, re.IGNORECASE)
-    if balance_match:
-        details['balance'] = float(balance_match.group(1))
-    
-    # ✅ Sender (for received transactions)
+    tx_patterns = [r'Transaction ID\s*[:]\s*([A-Z0-9]+)', r'Txn\s*[:]\s*([A-Z0-9]+)']
+    for p in tx_patterns:
+        m = re.search(p, body, re.IGNORECASE)
+        if m:
+            details['transaction_id'] = m.group(1)
+            break
     sender_match = re.search(r'from\s*([A-Za-z\s.]+)', body, re.IGNORECASE)
     if sender_match:
         details['sender'] = sender_match.group(1).strip()
-    
-    # ✅ Purpose
-    purpose_match = re.search(r'Purpose\s*[:]\s*(.+)', body, re.IGNORECASE)
-    if purpose_match:
-        details['purpose'] = purpose_match.group(1).strip()
-    
+    date_match = re.search(r'([0-9]{2}:[0-9]{2}\s*(AM|PM)\s*IST,\s*[0-9]{2}\s*[A-Za-z]+\s*[0-9]{4})', body, re.IGNORECASE)
+    if date_match:
+        details['date'] = date_match.group(1)
+        try:
+            time_str = date_match.group(1)
+            time_part = re.search(r'([0-9]{2}:[0-9]{2})\s*(AM|PM)', time_str)
+            if time_part:
+                hour, minute = map(int, time_part.group(1).split(':'))
+                ampm = time_part.group(2)
+                if ampm == 'PM' and hour != 12:
+                    hour += 12
+                elif ampm == 'AM' and hour == 12:
+                    hour = 0
+                now_utc = datetime.now(timezone.utc)
+                now_ist = now_utc.astimezone(IST)
+                dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour, minute, tzinfo=IST)
+                if dt > now_ist:
+                    dt -= timedelta(days=1)
+                details['payment_datetime'] = dt.isoformat()
+                details['time_diff_minutes'] = round((now_ist - dt).total_seconds() / 60, 1)
+        except:
+            pass
     return details
 
-def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0) -> Optional[Dict[str, Any]]:
-    """Search Gmail inbox for payment confirmation email using IMAP - FINAL VERSION"""
+def search_gmail_payment(amount=None, utr=None, time_window=None):
+    if time_window is None:
+        time_window = CONFIG['TIME_WINDOW_MINUTES']
+    mail = None
     try:
-        date_str = datetime.fromtimestamp(start_timestamp).strftime('%d-%b-%Y')
-        logger.info(f"🔍 Searching IMAP (Attempt {check_count})")
-        
-        # ✅ Search only emails from today
+        mail = connect_imap()
         result, data = mail.search(None, 'ALL')
-        if result != 'OK':
+        if result != 'OK' or not data[0]:
             return None
-        
-        email_ids = data[0].split()
-        if not email_ids:
-            logger.info(f"❌ No emails found")
-            return None
-        
-        logger.info(f"📬 Found {len(email_ids)} emails total")
-        
-        # ✅ Check ALL recent emails (not just last 30)
-        for msg_id in email_ids[-50:]:  # Increased to 50
-            msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
-            
-            try:
-                # ✅ Get email date to check if it's recent
-                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
-                if result == 'OK':
-                    header_data = data[0][1].decode('utf-8', errors='ignore')
-                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+        ids = data[0].split()
+        recent_ids = ids[-CONFIG['MAX_EMAILS_CHECK']:]
+        now_ist = datetime.now(IST)
+        for msg_id in recent_ids:
+            msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+            body = get_email_body(mail, msg_id_str)
+            if not body:
+                continue
+            details = parse_payment_email(body)
+            if details.get('type') != 'received':
+                continue
+            if details.get('payment_datetime'):
+                dt = datetime.fromisoformat(details['payment_datetime'])
+                if (now_ist - dt).total_seconds() / 60 > time_window:
+                    continue
+            elif details.get('time_diff_minutes') is not None and details['time_diff_minutes'] > time_window:
+                continue
+            else:
+                result2, data2 = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                if result2 == 'OK':
+                    header = data2[0][1].decode('utf-8', errors='ignore')
+                    date_match = re.search(r'Date:\s*(.+)', header, re.IGNORECASE)
                     if date_match:
                         try:
                             email_date = email.utils.parsedate_to_datetime(date_match.group(1))
-                            # ✅ Only process emails from last 2 hours
-                            time_diff = (datetime.now(email_date.tzinfo) - email_date).total_seconds() if email_date.tzinfo else (datetime.now() - email_date).total_seconds()
-                            if time_diff > 7200:  # 2 hours
+                            if email_date.tzinfo is None:
+                                email_date = email_date.replace(tzinfo=timezone.utc)
+                            diff = (datetime.now(timezone.utc) - email_date).total_seconds() / 60
+                            if diff > time_window:
                                 continue
                         except:
                             pass
-                
-                body = get_email_body_from_imap(mail, msg_id_str)
-                
-                if not body:
-                    continue
-                
-                # ✅ Parse payment details
-                payment_details = parse_payment_email(body)
-                
-                found_amount = payment_details.get('amount')
-                
-                if found_amount:
-                    logger.info(f"💰 Found: ₹{found_amount}, Expected: ₹{amount}")
-                    
-                    # ✅ Check amount match (with tolerance)
-                    if abs(found_amount - float(amount)) < 0.01:
-                        # ✅ Check if it's a RECEIVED transaction (not paid)
-                        if payment_details.get('type') == 'received':
-                            logger.info(f"✅ MATCH FOUND! Received ₹{found_amount}")
-                            payment_details['email_id'] = msg_id_str
-                            payment_details['timestamp'] = datetime.now().isoformat()
-                            payment_details['check_count'] = check_count
-                            return payment_details
-                        else:
-                            logger.info(f"⚠️ Found amount ₹{found_amount} but it's a PAID transaction, not RECEIVED")
-                    else:
-                        logger.info(f"❌ Amount mismatch: found ₹{found_amount}, expected ₹{amount}")
-                
-            except Exception as e:
-                logger.warning(f"Error processing email {msg_id_str}: {e}")
-                continue
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error searching email: {e}")
-        return None
-
-# ============================================
-# API ENDPOINTS
-# ============================================
-
-@app.route('/change-password', methods=['POST'])
-def change_password():
-    """Change Gmail app password - New 16 digit password"""
-    data = request.get_json()
-    if not data:
-        return jsonify({
-            'status': 'error',
-            'message': 'Invalid request body'
-        }), 400
-    
-    new_password = data.get('password')
-    if not new_password:
-        return jsonify({
-            'status': 'error',
-            'message': 'Password is required'
-        }), 400
-    
-    # ✅ Validate password length
-    if len(new_password) != 16:
-        return jsonify({
-            'status': 'error',
-            'message': 'Password must be exactly 16 characters'
-        }), 400
-    
-    # ✅ Test the new password before saving
-    try:
-        test_mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        test_mail.login(CONFIG['GMAIL_EMAIL'], new_password)
-        test_mail.logout()
-        logger.info("✅ New password test successful")
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Invalid password: {str(e)}'
-        }), 400
-    
-    # ✅ Update password
-    old_password = CONFIG['GMAIL_APP_PASSWORD']
-    CONFIG['GMAIL_APP_PASSWORD'] = new_password
-    
-    # ✅ Update .env file
-    try:
-        with open('.env', 'r') as f:
-            lines = f.readlines()
-        
-        with open('.env', 'w') as f:
-            for line in lines:
-                if line.startswith('GMAIL_APP_PASSWORD='):
-                    f.write(f'GMAIL_APP_PASSWORD={new_password}\n')
+            if amount is not None and details.get('amount') and abs(details['amount'] - amount) < 0.01:
+                if utr is not None:
+                    if details.get('utr') == utr:
+                        return details
                 else:
-                    f.write(line)
-        
-        logger.info("✅ Password updated in .env file")
+                    return details
+            elif utr is not None and details.get('utr') == utr:
+                return details
+        return None
     except Exception as e:
-        logger.error(f"Error updating .env: {e}")
-        # Revert password
-        CONFIG['GMAIL_APP_PASSWORD'] = old_password
-        return jsonify({
-            'status': 'error',
-            'message': f'Failed to update .env file: {str(e)}'
-        }), 500
-    
-    return jsonify({
-        'status': 'success',
-        'message': '✅ Password updated successfully',
-        'email': CONFIG['GMAIL_EMAIL'],
-        'password_length': len(new_password)
-    })
-
-@app.route('/generate-qr', methods=['GET'])
-def generate_qr():
-    amount = request.args.get('amount')
-    
-    if not amount:
-        return jsonify({
-            'status': 'error',
-            'message': 'Amount is required. Example: ?amount=99'
-        }), 400
-    
-    try:
-        num_amount = float(amount)
-        if num_amount <= 0:
-            raise ValueError("Amount must be positive")
-    except ValueError:
-        return jsonify({
-            'status': 'error',
-            'message': 'Amount must be a positive number'
-        }), 400
-    
-    qr_url = f"{CONFIG['QR_BASE_URL']}/{CONFIG['UPI_ID']}/{num_amount}/{CONFIG['PAYEE_NAME']}"
-    
-    # Generate copy text for QR
-    copy_text = f"""📱 UPI PAYMENT REQUEST
-================================
-💰 Amount: ₹{num_amount:.2f}
-📱 UPI ID: {CONFIG['UPI_ID']}
-👤 Payee: {CONFIG['PAYEE_NAME']}
-📅 Generated: {datetime.now().strftime('%I:%M %p, %d %b %Y')}
-================================
-🔗 QR URL: {qr_url}
-Scan this QR code using any UPI app to pay"""
-    
-    return jsonify({
-        'status': 'success',
-        'qr_url': qr_url,
-        'amount': num_amount,
-        'upi_id': CONFIG['UPI_ID'],
-        'payee': CONFIG['PAYEE_NAME'],
-        'instructions': 'Scan this QR code using any UPI app to pay',
-        'copy_text': copy_text  # ✅ One click copy
-    })
-
-@app.route('/verify-payment', methods=['POST', 'GET'])
-def verify_payment():
-    if request.method == 'GET':
-        amount = request.args.get('amount')
-        session_id = request.args.get('session_id')
-    else:
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'status': 'error',
-                'message': 'Invalid request body'
-            }), 400
-        amount = data.get('amount')
-        session_id = data.get('session_id')
-    
-    if not session_id:
-        session_id = f'session_{int(time.time())}_{os.urandom(4).hex()}'
-    
-    logger.info(f"[{session_id}] Payment verification started for ₹{amount}")
-    
-    if amount is None:
-        return jsonify({
-            'status': 'error',
-            'message': 'Amount is required'
-        }), 400
-    
-    try:
-        num_amount = float(amount)
-        if num_amount <= 0:
-            raise ValueError("Amount must be positive")
-    except ValueError:
-        return jsonify({
-            'status': 'error',
-            'message': 'Amount must be a positive number'
-        }), 400
-    
-    try:
-        mail = connect_imap()
-        start_timestamp = int(time.time())
-        
-        qr_url = f"{CONFIG['QR_BASE_URL']}/{CONFIG['UPI_ID']}/{num_amount}/{CONFIG['PAYEE_NAME']}"
-        
-        max_attempts = CONFIG['POLL_TIMEOUT'] // CONFIG['POLL_INTERVAL']
-        
-        for attempt in range(1, max_attempts + 1):
-            logger.info(f"[{session_id}] Checking attempt {attempt}/{max_attempts}")
-            
-            result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt)
-            
-            if result and result.get('amount'):
-                if abs(result.get('amount') - num_amount) < 0.01:
-                    result['status'] = 'success'
-                    result['message'] = '✅ Payment verified successfully!'
-                    result['qr_url'] = qr_url
-                    result['session_id'] = session_id
-                    result['attempt'] = attempt
-                    
-                    # ✅ Generate one-click copy text
-                    result['copy_text'] = generate_copy_text(result)
-                    
-                    mail.close()
-                    mail.logout()
-                    return jsonify(result)
-            
-            time.sleep(CONFIG['POLL_INTERVAL'])
-        
-        mail.close()
-        mail.logout()
-        
-        # Generate copy text for pending
-        pending_copy = f"""⏰ PAYMENT PENDING
-================================
-💰 Amount: ₹{num_amount:.2f}
-🆔 Session: {session_id}
-📅 Time: {datetime.now().strftime('%I:%M %p, %d %b %Y')}
-================================
-Status: ⏳ Waiting for payment...
-Please complete the payment and try again."""
-        
-        return jsonify({
-            'status': 'pending',
-            'amount': num_amount,
-            'qr_url': qr_url,
-            'session_id': session_id,
-            'message': '⏰ Payment not received. Please try again.',
-            'copy_text': pending_copy  # ✅ One click copy
-        })
-        
-    except Exception as e:
-        logger.error(f"[{session_id}] Error: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': f'❌ Payment verification failed: {str(e)}',
-            'session_id': session_id
-        }), 500
-
-@app.route('/verify-realtime', methods=['GET'])
-def verify_realtime():
-    amount = request.args.get('amount')
-    
-    if not amount:
-        return jsonify({
-            'status': 'error',
-            'message': 'Amount is required'
-        }), 400
-    
-    try:
-        num_amount = float(amount)
-        if num_amount <= 0:
-            raise ValueError("Amount must be positive")
-    except ValueError:
-        return jsonify({
-            'status': 'error',
-            'message': 'Amount must be a positive number'
-        }), 400
-    
-    def generate():
-        session_id = f'realtime_{int(time.time())}_{os.urandom(4).hex()}'
-        start_timestamp = int(time.time())
-        attempt = 0
-        max_attempts = 20
-        
-        try:
-            mail = connect_imap()
-            
-            yield f"data: {json.dumps({'status': 'checking', 'message': '🔍 Searching for payment...', 'amount': num_amount, 'session_id': session_id})}\n\n"
-            
-            while attempt < max_attempts:
-                attempt += 1
-                
-                result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt)
-                
-                if result and result.get('amount'):
-                    if abs(result.get('amount') - num_amount) < 0.01:
-                        result['status'] = 'success'
-                        result['message'] = '✅ Payment verified successfully!'
-                        result['session_id'] = session_id
-                        result['attempt'] = attempt
-                        
-                        # ✅ Generate one-click copy text
-                        result['copy_text'] = generate_copy_text(result)
-                        
-                        yield f"data: {json.dumps(result)}\n\n"
-                        mail.close()
-                        mail.logout()
-                        break
-                
-                progress = {
-                    'status': 'waiting',
-                    'message': f'⏳ Waiting for payment... Attempt {attempt}/{max_attempts}',
-                    'amount': num_amount,
-                    'session_id': session_id,
-                    'attempt': attempt,
-                    'max_attempts': max_attempts,
-                    'progress': round((attempt / max_attempts) * 100, 1),
-                    'copy_text': f"""⏳ WAITING FOR PAYMENT
-================================
-💰 Amount: ₹{num_amount:.2f}
-🔄 Attempt: {attempt}/{max_attempts}
-📅 Time: {datetime.now().strftime('%I:%M %p, %d %b %Y')}
-================================
-⏳ Status: Waiting...
-Please complete the payment and it will auto-detect."""
-                }
-                yield f"data: {json.dumps(progress)}\n\n"
-                time.sleep(CONFIG['POLL_INTERVAL'])
-            
-            if attempt >= max_attempts:
-                timeout_copy = f"""⏰ PAYMENT TIMEOUT
-================================
-💰 Amount: ₹{num_amount:.2f}
-🆔 Session: {session_id}
-📅 Time: {datetime.now().strftime('%I:%M %p, %d %b %Y')}
-================================
-❌ Status: Timeout - Payment not received.
-Please try again."""
-                
-                timeout_msg = {
-                    'status': 'timeout',
-                    'message': '⏰ Payment not received. Please try again.',
-                    'amount': num_amount,
-                    'session_id': session_id,
-                    'copy_text': timeout_copy  # ✅ One click copy
-                }
-                yield f"data: {json.dumps(timeout_msg)}\n\n"
+        logger.error(f"Gmail search error: {e}")
+        return None
+    finally:
+        if mail:
+            try:
                 mail.close()
                 mail.logout()
-                
-        except Exception as e:
-            error_copy = f"""❌ ERROR OCCURRED
-================================
-💰 Amount: ₹{num_amount:.2f}
-🆔 Session: {session_id}
-📅 Time: {datetime.now().strftime('%I:%M %p, %d %b %Y')}
-================================
-Error: {str(e)}
-Please try again or contact support."""
-            
-            error_msg = {
-                'status': 'error',
-                'message': f'❌ Error: {str(e)}',
-                'session_id': session_id,
-                'copy_text': error_copy  # ✅ One click copy
+            except:
+                pass
+
+# ============================================
+# ADMIN ROUTES
+# ============================================
+ADMIN_KEY = CONFIG['ADMIN_API_KEY']
+
+def admin_required():
+    provided = request.args.get('admin_key')
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        provided = auth_header.split(' ')[1]
+    return provided == ADMIN_KEY
+
+@app.route('/apikey_generate', methods=['GET'])
+def apikey_generate():
+    try:
+        if not admin_required():
+            return jsonify({'status': 'error', 'message': 'Invalid or missing admin_key'}), 401
+        name = request.args.get('name')
+        if not name:
+            return jsonify({'status': 'error', 'message': 'name parameter required'}), 400
+        hours = request.args.get('hours')
+        days = request.args.get('days')
+        expiry_hours = 24
+        if hours:
+            try: expiry_hours = int(hours)
+            except: pass
+        elif days:
+            try: expiry_hours = int(days) * 24
+            except: pass
+        api_key = db_create_api_key(name, expiry_hours)
+        return jsonify({
+            'status': 'success',
+            'api_key': api_key,
+            'name': name,
+            'expires_at': (datetime.now(timezone.utc) + timedelta(hours=expiry_hours)).isoformat()
+        })
+    except Exception as e:
+        logger.error(f"apikey_generate error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/admin_orders', methods=['GET'])
+def admin_orders():
+    try:
+        if not admin_required():
+            return jsonify({'status': 'error', 'message': 'Invalid or missing admin_key'}), 401
+        orders = db_get_pending_orders()
+        return jsonify({'status': 'success', 'orders': orders})
+    except Exception as e:
+        logger.error(f"admin_orders error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/admin_keys', methods=['GET'])
+def admin_keys():
+    try:
+        if not admin_required():
+            return jsonify({'status': 'error', 'message': 'Invalid or missing admin_key'}), 401
+        if supabase_client:
+            try:
+                result = supabase_client.table('api_keys').select('*').execute()
+                return jsonify({'status': 'success', 'api_keys': result.data})
+            except:
+                pass
+        return jsonify({'status': 'success', 'api_keys': list(app.fallback_api_keys.values())})
+    except Exception as e:
+        logger.error(f"admin_keys error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/admin_revoke', methods=['GET'])
+def admin_revoke():
+    try:
+        if not admin_required():
+            return jsonify({'status': 'error', 'message': 'Invalid or missing admin_key'}), 401
+        api_key = request.args.get('api_key')
+        if not api_key:
+            return jsonify({'status': 'error', 'message': 'api_key parameter required'}), 400
+        db_update_api_key(api_key, is_active=0)
+        return jsonify({'status': 'success', 'message': f'API key {api_key} revoked'})
+    except Exception as e:
+        logger.error(f"admin_revoke error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/admin_verify', methods=['GET'])
+def admin_verify():
+    try:
+        if not admin_required():
+            return jsonify({'status': 'error', 'message': 'Invalid or missing admin_key'}), 401
+        order_id = request.args.get('order_id')
+        utr = request.args.get('utr')
+        if not order_id or not utr:
+            return jsonify({'status': 'error', 'message': 'order_id and utr parameters required'}), 400
+        order = db_get_order(order_id)
+        if not order:
+            return jsonify({'status': 'error', 'message': 'Order not found'}), 404
+        if order['status'] == 'verified':
+            return jsonify({'status': 'error', 'message': 'Order already verified'}), 400
+        if db_is_utr_verified(utr):
+            return jsonify({'status': 'error', 'message': 'UTR already used'}), 400
+        db_update_order(order_id, status='verified', utr=utr)
+        db_mark_utr_verified(utr, order_id)
+        return jsonify({'status': 'success', 'message': 'Order verified manually'})
+    except Exception as e:
+        logger.error(f"admin_verify error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ============================================
+# PUBLIC API
+# ============================================
+@app.route('/api/qr.php', methods=['GET'])
+def api_qr():
+    try:
+        api_key = request.args.get('api_key')
+        amount = request.args.get('amount')
+        if not api_key or not amount:
+            return jsonify({'status': 'error', 'message': 'api_key and amount required'}), 400
+        key_info = db_validate_api_key(api_key)
+        if not key_info:
+            return jsonify({'status': 'error', 'message': 'Invalid or expired API key'}), 401
+        try:
+            amount = float(amount)
+            if amount <= 0:
+                raise ValueError
+        except:
+            return jsonify({'status': 'error', 'message': 'Invalid amount'}), 400
+        order_id = db_create_order(api_key, amount)
+        order = db_get_order(order_id)
+        if not order:
+            return jsonify({'status': 'error', 'message': 'Failed to create order'}), 500
+        upi_intent = f"upi://pay?pa={CONFIG['UPI_ID']}&pn=FamPay&tr={order_id}&tn=Payment+for+Order+{order_id}&am={amount}&cu=INR"
+        base_url = request.url_root.rstrip('/')
+        qr_url = f"{base_url}/api/qr-image.php?order_id={order_id}"
+        checkout_url = f"{base_url}/pay.php?order_id={order_id}"
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'order_id': order_id,
+                'qr_url': qr_url,
+                'checkout_url': checkout_url,
+                'upi_id': CONFIG['UPI_ID'],
+                'amount': str(amount),
+                'payable_amount': str(amount),
+                'upi_intent': upi_intent,
+                'created_at_ist': order['created_at'],
+                'expires_at_ist': order['expires_at']
             }
-            yield f"data: {json.dumps(error_msg)}\n\n"
-    
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
+        })
+    except Exception as e:
+        logger.error(f"api_qr error: {e}")
+        return jsonify({'status': 'error', 'message': 'Failed to create order'}), 500
+
+@app.route('/api/verify-order.php', methods=['GET'])
+def api_verify_order():
+    try:
+        api_key = request.args.get('api_key')
+        order_id = request.args.get('order_id')
+        if not api_key or not order_id:
+            return jsonify({'status': 'error', 'message': 'api_key and order_id required'}), 400
+        if not db_validate_api_key(api_key):
+            return jsonify({'status': 'error', 'message': 'Invalid API key'}), 401
+        order = db_get_order(order_id)
+        if not order:
+            return jsonify({'status': 'error', 'message': 'Order not found'}), 404
+
+        now_ist = datetime.now(IST)
+        expires_ist = datetime.strptime(order['expires_at'], '%d-%m-%Y %H:%M:%S').replace(tzinfo=IST)
+        if now_ist > expires_ist and order['status'] == 'pending':
+            db_update_order(order_id, status='expired')
+            order = db_get_order(order_id)
+
+        if order['status'] == 'pending':
+            payment = search_gmail_payment(amount=order['amount'])
+            if payment:
+                utr = payment.get('utr')
+                if utr and not db_is_utr_verified(utr):
+                    db_update_order(order_id, status='verified', utr=utr,
+                                 transaction_id=payment.get('transaction_id'),
+                                 sender_name=payment.get('sender'),
+                                 payment_time=payment.get('date'))
+                    db_mark_utr_verified(utr, order_id)
+                    order = db_get_order(order_id)
+
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'order_id': order['order_id'],
+                'status': order['status'],
+                'amount': order['amount'],
+                'payable_amount': order['payable_amount'],
+                'utr': order.get('utr'),
+                'transaction_id': order.get('transaction_id'),
+                'sender_name': order.get('sender_name'),
+                'payment_time_ist': order.get('payment_time')
+            }
+        })
+    except Exception as e:
+        logger.error(f"api_verify_order error: {e}")
+        return jsonify({'status': 'error', 'message': 'Failed to verify order'}), 500
+
+@app.route('/api/qr-image.php', methods=['GET'])
+def qr_image():
+    try:
+        order_id = request.args.get('order_id')
+        if not order_id:
+            return jsonify({'status': 'error', 'message': 'order_id required'}), 400
+        order = db_get_order(order_id)
+        if not order:
+            return jsonify({'status': 'error', 'message': 'Order not found'}), 404
+        upi_intent = f"upi://pay?pa={CONFIG['UPI_ID']}&pn=FamPay&tr={order_id}&tn=Payment+for+Order+{order_id}&am={order['amount']}&cu=INR"
+        qr = qrcode.QRCode(box_size=10, border=4)
+        qr.add_data(upi_intent)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#8B5CF6", back_color="#FFFFFF")
+        img_io = BytesIO()
+        img.save(img_io, 'PNG')
+        img_io.seek(0)
+        return send_file(img_io, mimetype='image/png')
+    except Exception as e:
+        logger.error(f"qr_image error: {e}")
+        return jsonify({'status': 'error', 'message': 'Failed to generate QR'}), 500
+
+# ============================================
+# PAYMENT PAGE (Premium Neon-Glow UI)
+# ============================================
+PAYMENT_PAGE_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pay ₹{amount} – FamGateway</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #050816;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            margin: 0;
+            overflow-x: hidden;
+            color: #F8FAFC;
+        }}
+        .ambient {{
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }}
+        .orb {{
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(120px);
+            will-change: transform;
+            animation: orbFloat 16s ease-in-out infinite alternate;
+        }}
+        .orb--violet {{ width: 60vw; height: 60vw; background: #8B5CF6; opacity: 0.15; top: -10%; left: -20%; animation-duration: 14s; }}
+        .orb--cyan {{ width: 50vw; height: 50vw; background: #06B6D4; opacity: 0.10; bottom: -10%; right: -10%; animation-duration: 18s; animation-delay: -4s; }}
+        .orb--pink {{ width: 40vw; height: 40vw; background: #EC4899; opacity: 0.08; top: 40%; left: 40%; animation-duration: 20s; animation-delay: -8s; }}
+        @keyframes orbFloat {{
+            0% {{ transform: translate(0, 0) scale(1); }}
+            100% {{ transform: translate(8%, 6%) scale(1.2); }}
+        }}
+        .card {{
+            position: relative;
+            z-index: 1;
+            background: rgba(5, 8, 22, 0.65);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 30px;
+            padding: 32px 28px;
+            max-width: 420px;
+            width: 100%;
+            border: 1px solid rgba(255,255,255,0.06);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6), 0 0 40px rgba(139,92,246,0.08);
+            transition: box-shadow 0.4s ease, transform 0.3s ease;
+        }}
+        .card:hover {{
+            box-shadow: 0 30px 80px rgba(0,0,0,0.7), 0 0 60px rgba(139,92,246,0.12);
+            transform: translateY(-2px);
+        }}
+        .card::before {{
+            content: '';
+            position: absolute;
+            inset: -2px;
+            border-radius: 32px;
+            padding: 2px;
+            background: linear-gradient(135deg, rgba(139,92,246,0.3), rgba(6,182,212,0.2), rgba(236,72,153,0.2));
+            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            pointer-events: none;
+            animation: borderPulse 8s ease-in-out infinite alternate;
+        }}
+        @keyframes borderPulse {{
+            0% {{ opacity: 0.4; }}
+            100% {{ opacity: 0.8; }}
+        }}
+        .header {{ text-align: center; margin-bottom: 22px; }}
+        .brand {{
+            font-size: 22px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            background: linear-gradient(135deg, #8B5CF6, #06B6D4, #EC4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        .order-total {{
+            background: rgba(139,92,246,0.08);
+            border-radius: 20px;
+            padding: 18px 16px;
+            text-align: center;
+            margin-bottom: 24px;
+            border: 1px solid rgba(139,92,246,0.15);
+        }}
+        .order-total .label {{ font-size: 13px; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; }}
+        .order-total .amount {{
+            font-size: 38px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #8B5CF6 0%, #06B6D4 50%, #EC4899 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-top: 2px;
+        }}
+        .order-total .currency {{ font-size: 20px; -webkit-text-fill-color: #94A3B8; }}
+        .qr-section {{ text-align: center; margin: 20px 0 16px; }}
+        .qr-wrapper {{
+            display: inline-block;
+            padding: 8px;
+            background: white;
+            border-radius: 18px;
+            box-shadow: 0 0 30px rgba(139,92,246,0.15), 0 0 60px rgba(6,182,212,0.08);
+            animation: qrGlow 4s ease-in-out infinite alternate;
+        }}
+        @keyframes qrGlow {{
+            0% {{ box-shadow: 0 0 20px rgba(139,92,246,0.15), 0 0 40px rgba(6,182,212,0.05); }}
+            100% {{ box-shadow: 0 0 40px rgba(139,92,246,0.30), 0 0 80px rgba(6,182,212,0.12); }}
+        }}
+        .qr-wrapper img {{ display: block; width: 200px; height: 200px; border-radius: 12px; background: white; }}
+        .qr-section .sub {{ font-size: 14px; color: #94A3B8; margin-top: 10px; }}
+        .qr-section .save-btn {{
+            display: inline-block;
+            margin-top: 12px;
+            background: rgba(255,255,255,0.06);
+            color: #E2E8F0;
+            padding: 8px 22px;
+            border-radius: 30px;
+            font-size: 14px;
+            font-weight: 500;
+            text-decoration: none;
+            border: 1px solid rgba(255,255,255,0.08);
+            transition: background 0.2s, transform 0.2s;
+        }}
+        .qr-section .save-btn:hover {{ background: rgba(255,255,255,0.12); transform: scale(1.02); }}
+        .details {{ margin: 20px 0; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 18px; }}
+        .detail-row {{ display: flex; justify-content: space-between; padding: 8px 0; font-size: 15px; }}
+        .detail-row .label {{ color: #94A3B8; }}
+        .detail-row .value {{ font-weight: 500; color: #F8FAFC; }}
+        .timer-warning {{ color: #F87171; font-weight: 600; }}
+        .glow-text {{ animation: textGlow 3s ease-in-out infinite alternate; }}
+        @keyframes textGlow {{
+            0% {{ text-shadow: 0 0 20px rgba(139,92,246,0.15); }}
+            100% {{ text-shadow: 0 0 40px rgba(139,92,246,0.35); }}
+        }}
+        .status {{
+            background: rgba(255,255,255,0.04);
+            border-radius: 16px;
+            padding: 16px;
+            text-align: center;
+            margin: 16px 0;
+            font-size: 15px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: background 0.5s, border-color 0.5s, color 0.5s;
+        }}
+        .status .spinner {{
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(139,92,246,0.2);
+            border-top-color: #8B5CF6;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+        .status.verified {{ background: rgba(34, 197, 94, 0.12); border-color: rgba(34, 197, 94, 0.25); color: #22C55E; }}
+        .status.verified .spinner {{ display: none; }}
+        .status.expired {{ background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.25); color: #F87171; }}
+        .status.expired .spinner {{ display: none; }}
+        .check-link {{ text-align: center; margin-top: 12px; font-size: 14px; }}
+        .check-link a {{ color: #8B5CF6; text-decoration: none; font-weight: 500; transition: color 0.2s; }}
+        .check-link a:hover {{ color: #A78BFA; text-decoration: underline; }}
+        .footer {{ text-align: center; margin-top: 20px; font-size: 13px; color: #475569; }}
+        @media (max-width: 480px) {{
+            .card {{ padding: 22px 18px; }}
+            .qr-wrapper img {{ width: 160px; height: 160px; }}
+            .order-total .amount {{ font-size: 32px; }}
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            .orb, .card::before, .qr-wrapper, .glow-text {{ animation: none !important; }}
+            .card:hover {{ transform: none !important; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="ambient">
+        <div class="orb orb--violet"></div>
+        <div class="orb orb--cyan"></div>
+        <div class="orb orb--pink"></div>
+    </div>
+    <div class="card">
+        <div class="header"><div class="brand">Fam<span style="-webkit-text-fill-color: white;">Gateway</span>™</div></div>
+        <div class="order-total">
+            <div class="label">ORDER TOTAL</div>
+            <div class="amount">₹ {amount:.2f} <span class="currency">INR</span></div>
+        </div>
+        <div class="qr-section">
+            <div class="qr-wrapper"><img id="qr-img" src="{qr_url}" alt="QR Code"></div>
+            <div class="sub">SCAN WITH ANY UPI APP</div>
+            <a href="{qr_url}" download="qr_{order_id}.png" class="save-btn">🔗 Save QR</a>
+        </div>
+        <div class="details">
+            <div class="detail-row"><span class="label">Merchant</span><span class="value">{merchant}</span></div>
+            <div class="detail-row"><span class="label">Order ID</span><span class="value">{order_id}</span></div>
+            <div class="detail-row"><span class="label">Expires In</span><span class="value glow-text" id="timer">--:--</span></div>
+        </div>
+        <div class="status" id="status"><span class="spinner"></span><span id="status-text">Waiting for payment…</span></div>
+        <div class="check-link"><a href="{verify_url}" target="_blank">Check Status</a></div>
+        <div class="footer">⚡ Auto‑verified instantly after UPI payment</div>
+    </div>
+    <script>
+        const expiresStr = "{expires_at}";
+        const [datePart, timePart] = expiresStr.split(' ');
+        const [dd, mm, yyyy] = datePart.split('-');
+        const [hh, min, sec] = timePart.split(':');
+        const expires = new Date(yyyy, mm-1, dd, hh, min, sec).getTime();
+        const timerEl = document.getElementById('timer');
+        function updateTimer() {{
+            const now = Date.now();
+            let diff = expires - now;
+            if (diff < 0) {{
+                timerEl.textContent = 'Expired';
+                timerEl.className = 'timer-warning';
+                document.getElementById('status').className = 'status expired';
+                document.getElementById('status-text').textContent = '⏰ Order expired';
+                return;
+            }}
+            const mins = Math.floor(diff / 60000);
+            const secs = Math.floor((diff % 60000) / 1000);
+            timerEl.textContent = String(mins).padStart(2,'0') + ':' + String(secs).padStart(2,'0');
+        }}
+        updateTimer();
+        setInterval(updateTimer, 1000);
+        const statusEl = document.getElementById('status');
+        const statusText = document.getElementById('status-text');
+        const verifyUrl = "{verify_url}";
+        function checkStatus() {{
+            fetch(verifyUrl)
+                .then(res => res.json())
+                .then(data => {{
+                    if (data.data && data.data.status === 'verified') {{
+                        statusEl.className = 'status verified';
+                        statusText.textContent = '✅ Payment Verified!';
+                        setTimeout(() => location.reload(), 1500);
+                    }} else if (data.data && data.data.status === 'expired') {{
+                        statusEl.className = 'status expired';
+                        statusText.textContent = '⏰ Order expired';
+                        setTimeout(() => location.reload(), 1000);
+                    }}
+                }})
+                .catch(() => {{}});
+        }}
+        setInterval(checkStatus, 3000);
+        checkStatus();
+    </script>
+</body>
+</html>
+'''
+
+# ============================================
+# SUCCESS PAGE (Premium Neon-Glow UI)
+# ============================================
+SUCCESS_PAGE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Successful 🎉</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #050816;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            margin: 0;
+            overflow: hidden;
+            color: #F8FAFC;
+        }}
+        .ambient {{
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }}
+        .orb {{
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(120px);
+            will-change: transform;
+            animation: orbFloat 18s ease-in-out infinite alternate;
+        }}
+        .orb--emerald {{ width: 60vw; height: 60vw; background: #22C55E; opacity: 0.12; top: -5%; left: -15%; animation-duration: 16s; }}
+        .orb--violet {{ width: 50vw; height: 50vw; background: #8B5CF6; opacity: 0.08; bottom: -10%; right: -5%; animation-duration: 20s; animation-delay: -5s; }}
+        .orb--cyan {{ width: 40vw; height: 40vw; background: #06B6D4; opacity: 0.06; top: 30%; left: 50%; animation-duration: 22s; animation-delay: -10s; }}
+        @keyframes orbFloat {{
+            0% {{ transform: translate(0, 0) scale(1); }}
+            100% {{ transform: translate(10%, 8%) scale(1.3); }}
+        }}
+        .card {{
+            position: relative;
+            z-index: 1;
+            background: rgba(5, 8, 22, 0.65);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 30px;
+            padding: 40px 32px;
+            max-width: 440px;
+            width: 100%;
+            border: 1px solid rgba(255,255,255,0.06);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6), 0 0 40px rgba(34,197,94,0.08);
+            animation: popIn 0.7s cubic-bezier(0.34, 1.56, 0.64, 1);
+            text-align: center;
+        }}
+        @keyframes popIn {{
+            0% {{ transform: scale(0.9) rotate(-2deg); opacity: 0; }}
+            100% {{ transform: scale(1) rotate(0); opacity: 1; }}
+        }}
+        .card::before {{
+            content: '';
+            position: absolute;
+            inset: -2px;
+            border-radius: 32px;
+            padding: 2px;
+            background: linear-gradient(135deg, rgba(34,197,94,0.3), rgba(139,92,246,0.2), rgba(6,182,212,0.2));
+            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            -webkit-mask-composite: xor;
+            mask-composite: exclude;
+            pointer-events: none;
+            animation: borderPulse 8s ease-in-out infinite alternate;
+        }}
+        @keyframes borderPulse {{
+            0% {{ opacity: 0.4; }}
+            100% {{ opacity: 0.8; }}
+        }}
+        .checkmark {{
+            width: 100px;
+            height: 100px;
+            background: linear-gradient(135deg, #22C55E, #16A34A);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            box-shadow: 0 0 60px rgba(34,197,94,0.4), 0 0 120px rgba(34,197,94,0.1);
+            animation: bounceIn 0.8s ease;
+        }}
+        .checkmark svg {{
+            width: 60px;
+            height: 60px;
+            fill: none;
+            stroke: white;
+            stroke-width: 4;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+            stroke-dasharray: 60;
+            stroke-dashoffset: 60;
+            animation: drawCheck 0.5s ease forwards 0.3s;
+        }}
+        @keyframes bounceIn {{
+            0% {{ transform: scale(0); }}
+            50% {{ transform: scale(1.15); }}
+            70% {{ transform: scale(0.95); }}
+            100% {{ transform: scale(1); }}
+        }}
+        @keyframes drawCheck {{
+            100% {{ stroke-dashoffset: 0; }}
+        }}
+        h1 {{
+            font-size: 28px;
+            background: linear-gradient(135deg, #22C55E, #06B6D4, #8B5CF6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin: 10px 0 6px;
+            font-weight: 700;
+        }}
+        .sub {{ color: #94A3B8; font-size: 16px; margin-bottom: 24px; }}
+        .detail-box {{
+            background: rgba(255,255,255,0.04);
+            border-radius: 16px;
+            padding: 18px;
+            text-align: left;
+            margin: 20px 0;
+            border: 1px solid rgba(255,255,255,0.06);
+        }}
+        .detail-row {{
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }}
+        .detail-row:last-child {{ border: none; }}
+        .detail-row .label {{ color: #94A3B8; }}
+        .detail-row .value {{ font-weight: 500; color: #F8FAFC; }}
+        .btn {{
+            display: inline-block;
+            background: linear-gradient(135deg, #8B5CF6, #6366F1);
+            color: white;
+            padding: 12px 36px;
+            border-radius: 40px;
+            text-decoration: none;
+            font-weight: 600;
+            box-shadow: 0 4px 20px rgba(139,92,246,0.3);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }}
+        .btn:hover {{ transform: scale(1.02); box-shadow: 0 6px 30px rgba(139,92,246,0.5); }}
+        .confetti-container {{
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }}
+        .confetti {{
+            position: absolute;
+            width: 10px; height: 10px;
+            opacity: 0.9;
+            animation: confettiFall linear forwards;
+        }}
+        @keyframes confettiFall {{
+            0% {{ transform: translateY(-10px) rotate(0deg) scale(1); opacity: 1; }}
+            100% {{ transform: translateY(110vh) rotate(720deg) scale(0.5); opacity: 0; }}
+        }}
+        @media (max-width: 480px) {{
+            .card {{ padding: 28px 18px; }}
+            .checkmark {{ width: 80px; height: 80px; }}
+            .checkmark svg {{ width: 48px; height: 48px; }}
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            .orb, .card::before, .checkmark, .confetti {{ animation: none !important; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="ambient">
+        <div class="orb orb--emerald"></div>
+        <div class="orb orb--violet"></div>
+        <div class="orb orb--cyan"></div>
+    </div>
+    <div class="confetti-container" id="confetti"></div>
+    <div class="card">
+        <div class="checkmark"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg></div>
+        <h1>Payment Successful!</h1>
+        <p class="sub">Your order has been verified instantly</p>
+        <div class="detail-box">
+            <div class="detail-row"><span class="label">Order ID</span><span class="value">{{ order_id }}</span></div>
+            <div class="detail-row"><span class="label">Amount</span><span class="value">₹ {{ amount }}</span></div>
+            <div class="detail-row"><span class="label">UTR</span><span class="value">{{ utr }}</span></div>
+            <div class="detail-row"><span class="label">Payment Time</span><span class="value">{{ payment_time }}</span></div>
+            <div class="detail-row"><span class="label">Sender</span><span class="value">{{ sender }}</span></div>
+        </div>
+        <a href="/" class="btn">Done</a>
+    </div>
+    <script>
+        (function() {{
+            const container = document.getElementById('confetti');
+            const colors = ['#22C55E', '#8B5CF6', '#06B6D4', '#EC4899', '#F59E0B', '#F87171', '#34D399', '#A78BFA'];
+            for (let i = 0; i < 120; i++) {{
+                const el = document.createElement('div');
+                el.className = 'confetti';
+                el.style.left = Math.random() * 100 + '%';
+                el.style.width = (Math.random() * 10 + 5) + 'px';
+                el.style.height = (Math.random() * 10 + 5) + 'px';
+                el.style.background = colors[Math.floor(Math.random() * colors.length)];
+                el.style.borderRadius = Math.random() > 0.5 ? '50%' : '2px';
+                el.style.animationDuration = (Math.random() * 2.5 + 1.5) + 's';
+                el.style.animationDelay = (Math.random() * 2.5) + 's';
+                container.appendChild(el);
+            }}
+        }})();
+    </script>
+</body>
+</html>
+'''
+
+# ============================================
+# EXPIRED PAGE (kept minimal, can be upgraded)
+# ============================================
+EXPIRED_PAGE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Order Expired ⏰</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #050816;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
         }
-    )
+        .card {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(20px);
+            border-radius: 30px;
+            padding: 40px 32px;
+            max-width: 420px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .icon { font-size: 64px; margin-bottom: 16px; }
+        h1 { color: #F87171; font-size: 26px; margin-bottom: 8px; }
+        .sub { color: #94A3B8; font-size: 16px; margin-bottom: 20px; }
+        .detail { background: rgba(255,255,255,0.04); border-radius: 12px; padding: 16px; margin: 16px 0; border: 1px solid rgba(255,255,255,0.06); }
+        .detail .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 15px; color: #E2E8F0; }
+        .row .label { color: #94A3B8; }
+        .row .value { font-weight: 500; }
+        .btn {
+            display: inline-block;
+            background: linear-gradient(135deg, #8B5CF6, #6366F1);
+            color: white;
+            padding: 12px 32px;
+            border-radius: 40px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: transform 0.2s;
+        }
+        .btn:hover { transform: scale(1.02); }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">⏰</div>
+        <h1>Order Expired</h1>
+        <p class="sub">This payment session has expired. Please create a new order.</p>
+        <div class="detail">
+            <div class="row"><span class="label">Order ID</span><span class="value">{{ order_id }}</span></div>
+            <div class="row"><span class="label">Amount</span><span class="value">₹ {{ amount }}</span></div>
+            <div class="row"><span class="label">Expired at</span><span class="value">{{ expires_at }}</span></div>
+        </div>
+        <a href="/" class="btn">Go Home</a>
+    </div>
+</body>
+</html>
+'''
+
+@app.route('/pay.php', methods=['GET'])
+def pay_page():
+    try:
+        order_id = request.args.get('order_id')
+        if not order_id:
+            return "Order ID missing", 400
+        order = db_get_order(order_id)
+        if not order:
+            return "Order not found", 404
+
+        base_url = request.url_root.rstrip('/')
+        qr_url = f"{base_url}/api/qr-image.php?order_id={order_id}"
+        verify_url = f"{base_url}/api/verify-order.php?api_key={order['api_key']}&order_id={order_id}"
+        amount = order['amount']
+        expires_at = order['expires_at']
+        merchant = CONFIG['PAYEE_NAME']
+        status = order['status']
+
+        if status == 'verified':
+            return render_template_string(SUCCESS_PAGE,
+                order_id=order_id,
+                utr=order.get('utr', 'N/A'),
+                amount=amount,
+                merchant=merchant,
+                payment_time=order.get('payment_time', ''),
+                sender=order.get('sender_name', '')
+            )
+
+        now_ist = datetime.now(IST)
+        expires_ist = datetime.strptime(expires_at, '%d-%m-%Y %H:%M:%S').replace(tzinfo=IST)
+        if now_ist > expires_ist:
+            if order['status'] == 'pending':
+                db_update_order(order_id, status='expired')
+            return render_template_string(EXPIRED_PAGE,
+                order_id=order_id,
+                amount=amount,
+                merchant=merchant,
+                expires_at=expires_at
+            )
+
+        return render_template_string(PAYMENT_PAGE_TEMPLATE,
+            amount=amount,
+            qr_url=qr_url,
+            order_id=order_id,
+            merchant=merchant,
+            expires_at=expires_at,
+            verify_url=verify_url
+        )
+    except Exception as e:
+        logger.error(f"pay_page error: {e}")
+        return "Internal error", 500
+
+# ============================================
+# OTHER ENDPOINTS (unchanged)
+# ============================================
+@app.route('/verify-fast', methods=['GET'])
+def verify_fast():
+    try:
+        amount = request.args.get('amount')
+        utr = request.args.get('utr')
+        time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
+        if not amount and not utr:
+            return jsonify({'status': 'error', 'message': 'Provide amount or utr'}), 400
+        try:
+            if amount:
+                amount = float(amount)
+            time_window = int(time_window)
+        except:
+            return jsonify({'status': 'error', 'message': 'Invalid input'}), 400
+        payment = search_gmail_payment(amount=amount, utr=utr, time_window=time_window)
+        if payment:
+            return jsonify({'status': 'success', 'message': '✅ Payment found!', 'data': payment})
+        else:
+            return jsonify({'status': 'not_found', 'message': f'❌ No matching payment found in last {time_window} minutes.'})
+    except Exception as e:
+        logger.error(f"verify_fast error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/verify-by-utr', methods=['GET', 'POST'])
+def verify_by_utr():
+    try:
+        if request.method == 'GET':
+            utr = request.args.get('utr')
+            time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
+        else:
+            data = request.get_json()
+            utr = data.get('utr') if data else None
+            time_window = data.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
+        if not utr:
+            return jsonify({'status': 'error', 'message': 'UTR required'}), 400
+        try:
+            time_window = int(time_window)
+        except:
+            return jsonify({'status': 'error', 'message': 'Invalid time_window'}), 400
+        payment = search_gmail_payment(utr=utr, time_window=time_window)
+        if payment:
+            return jsonify({'status': 'success', 'message': '✅ Payment found by UTR', 'data': payment})
+        else:
+            return jsonify({'status': 'not_found', 'message': f'No payment with UTR {utr} in last {time_window} min'})
+    except Exception as e:
+        logger.error(f"verify_by_utr error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/verify-last-payment', methods=['GET'])
+def verify_last_payment():
+    try:
+        amount = request.args.get('amount')
+        time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
+        if not amount:
+            return jsonify({'status': 'error', 'message': 'Amount required'}), 400
+        try:
+            amount = float(amount)
+            time_window = int(time_window)
+        except:
+            return jsonify({'status': 'error', 'message': 'Invalid input'}), 400
+        payment = search_gmail_payment(amount=amount, time_window=time_window)
+        if payment:
+            return jsonify({'status': 'success', 'message': '✅ Payment found', 'data': payment})
+        else:
+            return jsonify({'status': 'not_found', 'message': f'No payment of ₹{amount} in last {time_window} min'})
+    except Exception as e:
+        logger.error(f"verify_last_payment error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/verify-payment', methods=['GET', 'POST'])
+def verify_payment_legacy():
+    try:
+        if request.method == 'GET':
+            amount = request.args.get('amount')
+            time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
+        else:
+            data = request.get_json()
+            amount = data.get('amount') if data else None
+            time_window = data.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
+        if not amount:
+            return jsonify({'status': 'error', 'message': 'Amount required'}), 400
+        try:
+            amount = float(amount)
+            time_window = int(time_window)
+        except:
+            return jsonify({'status': 'error', 'message': 'Invalid input'}), 400
+        payment = search_gmail_payment(amount=amount, time_window=time_window)
+        if payment:
+            return jsonify({'status': 'success', 'message': '✅ Payment verified', 'data': payment})
+        else:
+            return jsonify({'status': 'pending', 'message': f'⏳ No payment found in last {time_window} min'})
+    except Exception as e:
+        logger.error(f"verify_payment error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/generate-qr', methods=['GET'])
+def generate_qr_legacy():
+    try:
+        amount = request.args.get('amount')
+        if not amount:
+            return jsonify({'status': 'error', 'message': 'Amount required'}), 400
+        try:
+            amount = float(amount)
+        except:
+            return jsonify({'status': 'error', 'message': 'Invalid amount'}), 400
+        upi_intent = f"upi://pay?pa={CONFIG['UPI_ID']}&pn=FamPay&am={amount}&cu=INR"
+        qr = qrcode.QRCode(box_size=10, border=4)
+        qr.add_data(upi_intent)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#8B5CF6", back_color="#FFFFFF")
+        img_io = BytesIO()
+        img.save(img_io, 'PNG')
+        img_io.seek(0)
+        return send_file(img_io, mimetype='image/png')
+    except Exception as e:
+        logger.error(f"generate_qr error: {e}")
+        return jsonify({'status': 'error', 'message': 'Failed to generate QR'}), 500
 
 @app.route('/debug-emails', methods=['GET'])
 def debug_emails():
-    """Debug endpoint - Show recent emails with copy feature"""
     try:
-        mail = connect_imap()
-        
-        result, data = mail.search(None, 'ALL')
-        if result != 'OK':
-            return jsonify({
-                'status': 'error',
-                'message': 'Failed to search emails'
-            }), 500
-        
-        email_ids = data[0].split()
-        if not email_ids:
-            return jsonify({
-                'status': 'success',
-                'gmail': CONFIG['GMAIL_EMAIL'],
-                'total_emails': 0,
-                'emails': []
-            })
-        
-        emails = []
-        # ✅ Get only last 20 emails
-        for msg_id in email_ids[-20:]:
-            msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
-            
-            try:
-                # ✅ Get email date
-                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
-                date_str = ""
-                if result == 'OK':
-                    header_data = data[0][1].decode('utf-8', errors='ignore')
-                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
-                    if date_match:
-                        date_str = date_match.group(1).strip()
-                
-                body = get_email_body_from_imap(mail, msg_id_str)
-                details = parse_payment_email(body)
-                
-                # ✅ Generate copy text for each email
-                copy_text = f"""📧 EMAIL DEBUG
-================================
-📧 Email ID: {msg_id_str}
-📅 Date: {date_str}
-================================
-💰 Amount: {details.get('amount', 'N/A')}
-🆔 Transaction ID: {details.get('transaction_id', 'N/A')}
-🔢 UTR: {details.get('utr', 'N/A')}
-👤 Sender: {details.get('sender', 'N/A')}
-📝 Purpose: {details.get('purpose', 'N/A')}
-💳 Balance: {details.get('balance', 'N/A')}
-📥 Type: {details.get('type', 'N/A')}
-================================
-📄 Preview: {body[:100] if body else 'No body'}..."""
-                
-                emails.append({
-                    'id': msg_id_str,
-                    'date': date_str,
-                    'body_preview': body[:200] if body else 'No body',
-                    'amount_found': details.get('amount'),
-                    'transaction_type': details.get('type'),
-                    'transaction_id': details.get('transaction_id'),
-                    'sender': details.get('sender'),
-                    'purpose': details.get('purpose'),
-                    'balance': details.get('balance'),
-                    'copy_text': copy_text  # ✅ One click copy
-                })
-            except Exception as e:
-                emails.append({
-                    'id': msg_id_str,
-                    'error': str(e),
-                    'copy_text': f"❌ Error: {str(e)}"
-                })
-        
-        mail.close()
-        mail.logout()
-        
-        return jsonify({
-            'status': 'success',
-            'gmail': CONFIG['GMAIL_EMAIL'],
-            'total_emails': len(emails),
-            'emails': emails
-        })
-        
+        payment = search_gmail_payment()
+        return jsonify({'status': 'debug', 'last_payment': payment})
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        logger.error(f"debug_emails error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
-def health_check():
-    copy_text = f"""✅ HEALTH CHECK
-================================
-📧 Gmail: {CONFIG['GMAIL_EMAIL']}
-📱 UPI ID: {CONFIG['UPI_ID']}
-📅 Timestamp: {datetime.now().isoformat()}
-================================
-Status: ✅ Healthy
-Auth: IMAP with App Password"""
-    
+def health():
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'gmail': CONFIG['GMAIL_EMAIL'],
-        'upi_id': CONFIG['UPI_ID'],
-        'auth_method': 'IMAP with App Password',
-        'gmail_configured': True,
-        'copy_text': copy_text  # ✅ One click copy
+        'timestamp': datetime.now(IST).isoformat(),
+        'supabase_configured': bool(supabase_client),
+        'gmail_configured': bool(CONFIG['GMAIL_EMAIL'] and CONFIG['GMAIL_APP_PASSWORD'])
     })
 
 @app.route('/', methods=['GET'])
 def index():
-    copy_text = f"""🚀 UPI PAYMENT VERIFIER API
-================================
-Version: 1.2.0
-📧 Gmail: {CONFIG['GMAIL_EMAIL']}
-📱 UPI ID: {CONFIG['UPI_ID']}
-================================
-✅ Status: FULLY WORKING
-🔄 Real-time verification: YES
-📋 One-click copy: YES
-================================
-Endpoints:
-• /generate-qr?amount=X
-• /verify-payment?amount=X
-• /verify-realtime?amount=X
-• /debug-emails
-• /health"""
-    
+    base_url = request.url_root.rstrip('/')
     return jsonify({
-        'name': 'UPI Auto-Payment Verifier API',
-        'version': '1.2.0',
-        'gmail': CONFIG['GMAIL_EMAIL'],
-        'status': '✅ FULLY WORKING',
-        'features': {
-            'one_click_copy': '✅ Enabled',
-            'real_time_verification': '✅ Enabled',
-            'email_detection': '✅ Working'
-        },
+        'name': 'UPI Auto-Payment Verifier',
+        'version': '5.0.0',
+        'description': 'Premium Neon-Glow UI with full payment verification.',
         'endpoints': {
-            'change_password': {
-                'method': 'POST',
-                'path': '/change-password',
-                'params': {'password': 'required (16 digits)'},
-                'example': {'password': '1234567890123456'}
-            },
-            'generate_qr': {
-                'method': 'GET',
-                'path': '/generate-qr',
-                'params': {'amount': 'required'},
-                'example': '/generate-qr?amount=1',
-                'copy_text': '✅ Included'
-            },
-            'verify_payment': {
-                'method': 'POST/GET',
-                'path': '/verify-payment',
-                'params': {'amount': 'required'},
-                'example': '/verify-payment?amount=1',
-                'copy_text': '✅ Included'
-            },
-            'verify_realtime': {
-                'method': 'GET',
-                'path': '/verify-realtime',
-                'params': {'amount': 'required'},
-                'example': '/verify-realtime?amount=1',
-                'copy_text': '✅ Included'
-            },
-            'debug_emails': {
-                'method': 'GET',
-                'path': '/debug-emails',
-                'copy_text': '✅ Included'
-            },
-            'health': {
-                'method': 'GET',
-                'path': '/health',
-                'copy_text': '✅ Included'
+            'public': {
+                '/': 'GET - Documentation',
+                '/health': 'GET - Health check',
+                '/generate-qr': 'GET - Generate colored QR (e.g., ?amount=499)',
+                '/verify-fast': 'GET - Instant verify by amount or UTR',
+                '/verify-by-utr': 'GET/POST - Verify by UTR only',
+                '/verify-last-payment': 'GET - One-shot check by amount',
+                '/verify-payment': 'GET/POST - Legacy polling',
+                '/api/qr.php': 'GET - Create order and get QR (api_key, amount)',
+                '/api/verify-order.php': 'GET - Check order status (api_key, order_id)',
+                '/api/qr-image.php': 'GET - Get colored QR image (order_id)',
+                '/pay.php': 'GET - Payment page with neon-glow UI (order_id)',
+                '/debug-emails': 'GET - Debug'
             }
         },
-        'copy_text': copy_text  # ✅ One click copy
+        'examples': {
+            'create_order': f'curl "{base_url}/api/qr.php?api_key=fam_YOUR_KEY&amount=499"',
+            'verify_by_amount': f'curl "{base_url}/verify-fast?amount=1"',
+            'payment_page': f'Open in browser: {base_url}/pay.php?order_id=Khan_YOUR_ID'
+        }
     })
 
+# ============================================
+# VERCEL ENTRY POINT
+# ============================================
 if __name__ == '__main__':
-    logger.info("=" * 50)
-    logger.info("🚀 UPI PAYMENT VERIFIER API - v1.2.0")
-    logger.info("📋 ONE CLICK COPY FEATURE ADDED")
-    logger.info("=" * 50)
-    logger.info(f"📧 Gmail: {CONFIG['GMAIL_EMAIL']}")
-    logger.info(f"🔐 App Password: {CONFIG['GMAIL_APP_PASSWORD']}")
-    logger.info(f"📱 UPI ID: {CONFIG['UPI_ID']}")
-    logger.info(f"🌐 Server: http://127.0.0.1:{CONFIG['PORT']}")
-    logger.info("=" * 50)
-    logger.info("📌 FEATURES:")
-    logger.info("  ✅ One Click Copy - All responses")
-    logger.info("  ✅ Real-time SSE Streaming")
-    logger.info("  ✅ Email Detection Working")
-    logger.info("=" * 50)
-    logger.info("📌 TEST NOW:")
-    logger.info(f"  🔍 /debug-emails")
-    logger.info(f"  ✅ /verify-payment?amount=1")
-    logger.info(f"  ⭐ /verify-realtime?amount=1")
-    logger.info("=" * 50)
-    
-    app.run(
-        host='0.0.0.0',
-        port=CONFIG['PORT'],
-        debug=False,
-        threaded=True
-    )
+    app.run(host='0.0.0.0', port=5000, debug=False)
